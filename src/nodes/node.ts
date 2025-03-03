@@ -1,50 +1,134 @@
-import bodyParser from "body-parser";
 import express from "express";
+import bodyParser from "body-parser";
 import { BASE_NODE_PORT } from "../config";
 import { Value } from "../types";
+import axios from "axios";
+
+type NodeState = {
+  killed: boolean;
+  x: 0 | 1 | '?' | null;
+  decided: boolean | null;
+  k: number | null;
+  consensusRunning: boolean;
+  phase1Messages: Array<{ sender: number, value: 0 | 1 | '?', step: number }>;
+  phase2Messages: Array<{ sender: number, value: 0 | 1 | '?', step: number }>;
+};
 
 export async function node(
-  nodeId: number, // the ID of the node
-  N: number, // total number of nodes in the network
-  F: number, // number of faulty nodes in the network
-  initialValue: Value, // initial value of the node
-  isFaulty: boolean, // true if the node is faulty, false otherwise
-  nodesAreReady: () => boolean, // used to know if all nodes are ready to receive requests
-  setNodeIsReady: (index: number) => void // this should be called when the node is started and ready to receive requests
+  nodeId: number, 
+  N: number, 
+  F: number, 
+  initialValue: Value, 
+  isFaulty: boolean, 
+  nodesAreReady: () => boolean, 
+  setNodeIsReady: (index: number) => void 
 ) {
   const node = express();
   node.use(express.json());
   node.use(bodyParser.json());
 
-  // TODO implement this
-  // this route allows retrieving the current status of the node
-  // node.get("/status", (req, res) => {});
+  let nodeState: NodeState = {
+    killed: false,
+    x: initialValue,
+    decided: false,
+    k: 0,
+    consensusRunning: false,
+    phase1Messages: [],
+    phase2Messages: []
+  };
 
-  // TODO implement this
-  // this route allows the node to receive messages from other nodes
-  // node.post("/message", (req, res) => {});
-
-  // TODO implement this
-  // this route is used to start the consensus algorithm
-  // node.get("/start", async (req, res) => {});
-
-  // TODO implement this
-  // this route is used to stop the consensus algorithm
-  // node.get("/stop", async (req, res) => {});
-
-  // TODO implement this
-  // get the current state of a node
-  // node.get("/getState", (req, res) => {});
-
-  // start the server
-  const server = node.listen(BASE_NODE_PORT + nodeId, async () => {
-    console.log(
-      `Node ${nodeId} is listening on port ${BASE_NODE_PORT + nodeId}`
-    );
-
-    // the node is ready
-    setNodeIsReady(nodeId);
+  node.get('/status', (req, res) => {
+    return res.status(isFaulty ? 500 : 200).send(isFaulty ? 'faulty' : 'live');
   });
 
+  node.get('/getState', (req, res) => {
+    return res.status(200).json({
+      killed: nodeState.killed,
+      x: nodeState.x,
+      decided: nodeState.decided,
+      k: nodeState.k
+    });
+  });
+
+  const flipCoin = (): 0 | 1 => (Math.random() < 0.5 ? 0 : 1);
+
+  const broadcastMessage = async (phase: number, value: 0 | 1 | '?', step: number) => {
+    if (nodeState.killed || isFaulty) return;
+    await Promise.all(
+      Array.from({ length: N }, (_, i) =>
+        i !== nodeId ? axios.post(`http://localhost:${BASE_NODE_PORT + i}/message`, { sender: nodeId, phase, value, step }).catch(() => {}) : null
+      ).filter(Boolean)
+    );
+  };
+
+  node.post('/message', (req, res) => {
+    if (nodeState.killed || isFaulty) return res.status(500).send('Node is faulty or killed');
+    const { sender, phase, value, step } = req.body;
+    if (typeof sender !== 'number' || typeof phase !== 'number' || typeof value === 'undefined' || typeof step !== 'number') {
+      return res.status(400).send('Invalid message format');
+    }
+    if (step === nodeState.k) {
+      if (phase === 1) nodeState.phase1Messages.push({ sender, value, step });
+      if (phase === 2) nodeState.phase2Messages.push({ sender, value, step });
+    }
+    return res.status(200).send('Message received');
+  });
+
+  const runStep = async () => {
+    if (nodeState.killed || isFaulty || nodeState.decided) return false;
+    nodeState.phase1Messages = [];
+    nodeState.phase2Messages = [];
+    await broadcastMessage(1, nodeState.x as 0 | 1 | '?', nodeState.k as number);
+    nodeState.phase1Messages.push({ sender: nodeId, value: nodeState.x as 0 | 1 | '?', step: nodeState.k as number });
+    await new Promise(resolve => setTimeout(resolve, 200));
+    if (nodeState.killed) return false;
+    const phase1Counts = { 0: 0, 1: 0, '?': 0 };
+    nodeState.phase1Messages.forEach(msg => phase1Counts[msg.value]++);
+    let phase2Value: 0 | 1 | '?' = '?';
+    if (phase1Counts[0] > (N / 2)) phase2Value = 0;
+    else if (phase1Counts[1] > (N / 2)) phase2Value = 1;
+    await broadcastMessage(2, phase2Value, nodeState.k as number);
+    nodeState.phase2Messages.push({ sender: nodeId, value: phase2Value, step: nodeState.k as number });
+    await new Promise(resolve => setTimeout(resolve, 200));
+    if (nodeState.killed) return false;
+    const phase2Counts = { 0: 0, 1: 0, '?': 0 };
+    nodeState.phase2Messages.forEach(msg => phase2Counts[msg.value]++);
+    if (phase2Counts[0] > (N / 2) || phase2Counts[1] > (N / 2)) {
+      nodeState.x = phase2Counts[0] > phase2Counts[1] ? 0 : 1;
+      nodeState.decided = true;
+    } else {
+      nodeState.x = flipCoin();
+    }
+    nodeState.k = (nodeState.k as number) + 1;
+    return !nodeState.decided;
+  };
+
+  node.get('/start', async (req, res) => {
+    if (nodeState.killed || isFaulty) return res.status(500).send('Node is faulty or killed');
+    if (nodeState.consensusRunning) return res.status(200).send('Consensus already running');
+    nodeState.k = 0;
+    nodeState.decided = false;
+    nodeState.consensusRunning = true;
+    (async () => {
+      let stepCount = 0;
+      while (await runStep() && stepCount < 2 && !nodeState.killed) {
+        stepCount++;
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
+      nodeState.consensusRunning = false;
+    })();
+    return res.status(200).send('Consensus started');
+  });
+
+  node.get('/stop', async (req, res) => {
+    nodeState.killed = true;
+    nodeState.consensusRunning = false;
+    nodeState.x = null;
+    nodeState.decided = null;
+    nodeState.k = null;
+    return res.status(200).send('Consensus stopped');
+  });
+
+  const server = node.listen(BASE_NODE_PORT + nodeId, () => setNodeIsReady(nodeId));
   return server;
 }
